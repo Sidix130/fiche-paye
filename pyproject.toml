@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fiche-paye"
+version = "0.1.0"
+description = "Classe localement les bulletins de paie PDF reçus dans Gmail"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "google-api-python-client>=2.100.0",
+  "google-auth-httplib2>=0.2.0",
+  "google-auth-oauthlib>=1.2.0",
+  "pypdf>=4.0.0",
+]
+
+[project.scripts]
+fiche-paye = "fiche_paye:main"
+
+[tool.setuptools]
+py-modules = ["fiche_paye"]
+
+[tool.ruff.lint]
+ignore = ["BLE001"]

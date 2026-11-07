@@ -1,0 +1,2 @@
+[console_scripts]
+fiche-paye = fiche_paye:main

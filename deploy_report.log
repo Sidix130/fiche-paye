@@ -1,0 +1,34 @@
+=== RAPPORT DE DÉPLOIEMENT FICHE-PAYE ===
+Date          : 2026-10-11T15:29:09+02:00
+Commit Git    : e0bbce8a
+Poste local   : Linux 7.2.9-1-cachyos x86_64 (Python 3.14.7)
+Cible visée   : gerard@192.168.1.178:22
+Dossier cible : ~/fiche-paye-validation
+==========================================
+
+[1/5] Validation locale sur CachyOS...
+Manifeste local (SHA256) :
+3164a0c16c82bb648e02a0d477d9b53d9ca2ff278094dfef4562c09e28194cbd  pyproject.toml
+41b822828db77c2908f4126e717a840efcf37b011b92b8ba3eb61fce0390c86d  fiche_paye.py
+52757691485cef05416e58c5f66a0477b72f98e75e1f4ec71ff8f976994c44a2  README.md
+14eb95a0b945c82b5a3f20c162e1bf5f31dffbc974c09e0de3560c221eaf6c50  tests/test_fiche_paye.py
+Exécution des tests unitaires locaux :
+test_explicit_compound_field (test_fiche_paye.NameAndFilenameTests.test_explicit_compound_field) ... ok
+test_filename_one_year_digit (test_fiche_paye.NameAndFilenameTests.test_filename_one_year_digit) ... ok
+test_filename_two_year_digits (test_fiche_paye.NameAndFilenameTests.test_filename_two_year_digits) ... ok
+test_separate_fields (test_fiche_paye.NameAndFilenameTests.test_separate_fields) ... ok
+test_french_month_names (test_fiche_paye.PayPeriodTests.test_french_month_names) ... ok
+test_no_period_no_guess (test_fiche_paye.PayPeriodTests.test_no_period_no_guess) ... ok
+test_numeric_range (test_fiche_paye.PayPeriodTests.test_numeric_range) ... ok
+test_previous_month_across_year_boundary (test_fiche_paye.PayPeriodTests.test_previous_month_across_year_boundary) ... ok
+
+----------------------------------------------------------------------
+Ran 8 tests in 0.006s
+
+OK
+-> Tests locaux : SUCCÈS
+
+[2/5] Contrôle de connectivité SSH vers gerard@192.168.1.178:22...
+ERREUR: Connexion SSH impossible vers gerard@192.168.1.178 (timeout: 2s)
+Détail : ssh: connect to host 192.168.1.178 port 22: Connection timed out
+Diagnostic : Vérifier si la machine est allumée/en ligne, l'IP réelle et la clé SSH.

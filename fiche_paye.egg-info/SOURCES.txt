@@ -1,0 +1,10 @@
+README.md
+fiche_paye.py
+pyproject.toml
+fiche_paye.egg-info/PKG-INFO
+fiche_paye.egg-info/SOURCES.txt
+fiche_paye.egg-info/dependency_links.txt
+fiche_paye.egg-info/entry_points.txt
+fiche_paye.egg-info/requires.txt
+fiche_paye.egg-info/top_level.txt
+tests/test_fiche_paye.py
