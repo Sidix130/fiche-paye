@@ -12,25 +12,34 @@ import io
 import itertools
 import os
 import re
+import shutil
+import subprocess
 import sys
 import unicodedata
+import zipfile
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
-DEPENDENCY_ERROR: str | None = None
+GMAIL_DEPENDENCY_ERROR: str | None = None
 try:
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
     from google_auth_oauthlib.flow import InstalledAppFlow
     from googleapiclient.discovery import build
     from googleapiclient.errors import HttpError
+except ImportError as exc:
+    GMAIL_DEPENDENCY_ERROR = str(exc)
+    Request = Credentials = InstalledAppFlow = build = HttpError = None  # type: ignore[misc]
+
+DEPENDENCY_ERROR = GMAIL_DEPENDENCY_ERROR
+
+try:
     from pypdf import PdfReader
-except ImportError as exc:  # Keep pure parsing helpers importable for unit tests.
-    DEPENDENCY_ERROR = str(exc)
-    Request = Credentials = InstalledAppFlow = build = HttpError = PdfReader = None  # type: ignore[misc]
+except ImportError:
+    PdfReader = None  # type: ignore[misc]
 
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 DEFAULT_SENDER = "admin@ouihelp.fr"
@@ -61,17 +70,7 @@ PERIOD_PATTERN = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
-@dataclass(frozen=True)
-class PayPeriod:
-    start: date
-    end: date
-
-@dataclass(frozen=True)
-class AttachmentCandidate:
-    message_id: str
-    message_date: str
-    filename: str
-    data: bytes
+from fiche_paye.models import AttachmentCandidate, DocumentCandidate, PayPeriod
 
 
 def config_dir() -> Path:
@@ -173,7 +172,7 @@ def _format_given_names(given_names: str) -> str:
     formatted: list[str] = []
     for part in parts:
         if part and re.fullmatch(r"[ -]+", part):
-            formatted.append(part)
+            formatted.append("-")
         elif part:
             formatted.append(part[:1].upper() + part[1:].lower())
     return "".join(formatted)
@@ -189,6 +188,150 @@ def _safe_name_pair(surname: str, given_names: str) -> str | None:
     return f"{_format_surname(surname)}-{_format_given_names(given_names)}"
 
 
+STREET_TYPES = (
+    r"(?:rue|avenue|av\.?|boulevard|bd\.?|impasse|chemin|route|all[eé]e|place|quai|"
+    r"square|cours|voie|hameau|clos|r[eé]sidence|b[aâ]timent|lieu[- ]dit)"
+)
+
+ADDRESS_INDICATORS = re.compile(
+    rf"^(?:"
+    rf"\d+[\s,-]+(?:bis|ter|quater[\s,-]+)?{STREET_TYPES}\b|"
+    rf"{STREET_TYPES}\b|"
+    rf"\d{{5}}\s+[A-Za-zÀ-ÖØ-öø-ÿ]|"
+    rf"bp\s*\d+|cs\s*\d+|"
+    rf"zi\b|za\b|zone\b|cedex\b"
+    rf")",
+    re.IGNORECASE,
+)
+
+TECHNICAL_INDICATORS = re.compile(
+    r"^(?:siret\b|urssaf\b|ape\b|naf\b|convention\b|n[o°]\s*(?:employeur|ss|de\s*s[eé]curit[eé])\b|bulletin\b|matricule\b|paiement\b|virement\b)",
+    re.IGNORECASE,
+)
+
+
+def _is_address_or_technical(line: str) -> bool:
+    line_clean = line.strip()
+    return bool(ADDRESS_INDICATORS.match(line_clean) or TECHNICAL_INDICATORS.match(line_clean))
+
+
+def _clean_corporate_name(raw: str) -> str | None:
+    val = _clean_field_value(raw)
+    if _is_address_or_technical(val):
+        return None
+    # Préservation de &, ., chiffres, lettres, tirets et apostrophes (non destructif)
+    val = re.sub(r"[^A-Za-z0-9À-ÖØ-öø-ÿÆæŒœ&.' -]", "", val)
+    val = re.sub(r"\s+", "-", val.strip(" -.'"))
+    if not val or len(val) < 2 or len(val) > 60:
+        return None
+    return val
+
+
+def extract_employer_name(pdf_text: str) -> str | None:
+    """Return NOM-Prénom or corporate identity for the employer when explicitly labelled in the PDF.
+
+    Strict contract:
+    - Never falls back to employee identity.
+    - If absent, ambiguous or multiple distinct employers are found: returns None.
+    - Lines containing addresses or technical headers are rejected.
+    """
+    text = pdf_text.replace("\x00", "\n")
+
+    # 1. Détection préalable d'ambiguïté : co-employeur ou employeur secondaire explicite
+    ambiguous_mentions = re.findall(
+        r"(?im)^\s*(?:co[- ]employeur|employeur\s+secondaire|autre\s+employeur)\s*[:\-]?\s*([^\r\n]{2,60})",
+        text,
+    )
+    if ambiguous_mentions:
+        return None
+
+    # 2. Raison sociale explicitement libellée
+    m = re.search(r"(?im)^\s*raison\s+sociale\s*[:\-]\s*([^\r\n]{2,60})", text)
+    if m:
+        comp = _clean_corporate_name(m.group(1))
+        if comp:
+            return comp
+
+    # 3. Nom de l'employeur explicitement libellé en champ unique
+    m = re.search(r"(?im)^\s*nom\s+de\s+l['’]employeur\s*[:\-]\s*([^\r\n]{1,60})", text)
+    if m:
+        val = _clean_field_value(m.group(1))
+        tokens = val.split()
+        if len(tokens) >= 2:
+            pair = _safe_name_pair(tokens[0], " ".join(tokens[1:]))
+            if pair:
+                return pair
+        comp = _clean_corporate_name(m.group(1))
+        if comp:
+            return comp
+
+    # 4. Bloc multiligne ou en ligne "Employeur" / "Particulier employeur"
+    block_matches = list(
+        re.finditer(
+            r"(?im)^\s*(?:particulier\s+employeur|employeur)\s*[:\-]?\s*(?:\r?\n|\s+)\s*([^\r\n]{2,80})",
+            text,
+        )
+    )
+    if not block_matches:
+        return None
+
+    candidates_found: list[str] = []
+    for match in block_matches:
+        candidate_line = match.group(1).strip()
+        if _is_address_or_technical(candidate_line):
+            continue
+
+        # Cas A : Format personne physique avec virgule "NOM, Prénom"
+        comma_m = re.match(
+            r"^([A-Za-zÀ-ÖØ-öø-ÿÆæŒœ'’ -]+),\s*([A-Za-zÀ-ÖØ-öø-ÿÆæŒœ'’ -]+)$",
+            candidate_line,
+        )
+        if comma_m:
+            surname_piece = comma_m.group(1)
+            given_piece = comma_m.group(2)
+            if not _is_address_or_technical(surname_piece) and not _is_address_or_technical(given_piece):
+                pair = _safe_name_pair(surname_piece, given_piece)
+                if pair:
+                    candidates_found.append(pair)
+                    continue
+
+        # Cas B : Personne morale avec forme juridique explicite, raison sociale ou dénomination commerciale
+        corporate = _clean_corporate_name(candidate_line)
+        if corporate and any(
+            re.search(p, candidate_line, re.IGNORECASE)
+            for p in (
+                r"\b(?:SASU?|SARL|EURL|SA|SNC|SCI|EARL|SCEA|SCOP|ASSOCIATION|ADMR|ETS|ENTREPRISE|SERVICES?)\b",
+                r"&",
+                r"\d",
+            )
+        ):
+            candidates_found.append(corporate)
+            continue
+
+        # Cas C : Personne physique sans virgule "NOM Prénom"
+        words = candidate_line.split()
+        if len(words) >= 2 and not _is_address_or_technical(words[0]):
+            pair = _safe_name_pair(words[0], " ".join(words[1:]))
+            if pair:
+                candidates_found.append(pair)
+                continue
+
+        # Cas D : Autre personne morale sans forme juridique mais dénomination en majuscules
+        if corporate and len(words) >= 2 and candidate_line.isupper():
+            candidates_found.append(corporate)
+            continue
+
+    if not candidates_found:
+        return None
+
+    # Détection d'ambiguïté : plusieurs employeurs différents trouvés
+    unique_candidates = sorted(set(candidates_found))
+    if len(unique_candidates) > 1:
+        return None
+
+    return unique_candidates[0]
+
+
 def extract_employee_name(pdf_text: str) -> str | None:
     """Return NOM-Prénom only when the PDF has reasonably explicit labels.
 
@@ -196,6 +339,26 @@ def extract_employee_name(pdf_text: str) -> str | None:
     --employee-name or manually inspect the PDF instead of guessing.
     """
     text = pdf_text.replace("\x00", "\n")
+
+    # Multiline block: "Salarié\nNOM, Prénom" or "Salariée\nNOM, Prénom"
+    m = re.search(
+        r"(?im)^\s*(?:salari[eé](?:e)?)\s*[:\-]?\s*\r?\n\s*([A-Za-zÀ-ÖØ-öø-ÿÆæŒœ'’ -]+),\s*([A-Za-zÀ-ÖØ-öø-ÿÆæŒœ'’ -]+)",
+        text,
+    )
+    if m:
+        pair = _safe_name_pair(m.group(1), m.group(2))
+        if pair:
+            return pair
+
+    # Single line: "Salarié : NOM, Prénom"
+    m = re.search(
+        r"(?im)^\s*(?:salari[eé](?:e)?)\s*[:\-]\s*([A-Za-zÀ-ÖØ-öø-ÿÆæŒœ'’ -]+),\s*([A-Za-zÀ-ÖØ-öø-ÿÆæŒœ'’ -]+)",
+        text,
+    )
+    if m:
+        pair = _safe_name_pair(m.group(1), m.group(2))
+        if pair:
+            return pair
 
     # Most reliable case: separately labelled surname and given name fields.
     surname_patterns = [
@@ -249,20 +412,7 @@ def extract_employee_name(pdf_text: str) -> str | None:
     return None
 
 
-def sanitize_filename_component(value: str) -> str:
-    value = value.replace("/", "-").replace("\\", "-")
-    value = re.sub(r"[\x00-\x1f<>:\"|?*]", "", value)
-    value = re.sub(r"\s+", "-", value.strip())
-    value = re.sub(r"-+", "-", value)
-    return value.strip(".- ") or "inconnu"
-
-
-def expected_filename(year: int, month: int, employee_name: str, year_digits: int = 1) -> str:
-    if year_digits not in (1, 2, 4):
-        raise ValueError("year_digits doit être 1, 2 ou 4")
-    year_text = str(year)[-year_digits:]
-    safe_name = sanitize_filename_component(employee_name)
-    return f"{month:02d}-{year_text}_{safe_name}.pdf"
+from fiche_paye.namer import expected_filename, sanitize_filename_component
 
 
 def read_pdf_text(data: bytes) -> str:
@@ -270,21 +420,99 @@ def read_pdf_text(data: bytes) -> str:
         raise ValueError("la pièce jointe ne semble pas être un PDF")
     if len(data) > MAX_PDF_BYTES:
         raise ValueError(f"PDF trop volumineux ({len(data) // (1024 * 1024)} Mio, limite 30 Mio)")
-    reader = PdfReader(io.BytesIO(data), strict=False)
-    if reader.is_encrypted:
+
+    if PdfReader is not None:
         try:
-            unlocked = reader.decrypt("")
-        except Exception as exc:
-            raise ValueError("PDF chiffré ou protégé par mot de passe") from exc
-        if not unlocked:
-            raise ValueError("PDF chiffré ou protégé par mot de passe")
-    pages: list[str] = []
-    for page in reader.pages:
-        try:
-            pages.append(page.extract_text() or "")
+            reader = PdfReader(io.BytesIO(data), strict=False)
+            if reader.is_encrypted:
+                try:
+                    unlocked = reader.decrypt("")
+                except Exception as exc:
+                    raise ValueError("PDF chiffré ou protégé par mot de passe") from exc
+                if not unlocked:
+                    raise ValueError("PDF chiffré ou protégé par mot de passe")
+            pages: list[str] = []
+            for page in reader.pages:
+                try:
+                    pages.append(page.extract_text() or "")
+                except Exception:
+                    pages.append("")
+            text = "\n".join(pages)
+            if text.strip():
+                return text
         except Exception:
-            pages.append("")
-    return "\n".join(pages)
+            pass  # Fallback to pdftotext if pypdf is unavailable or failed.
+
+    pdftotext_bin = shutil.which("pdftotext")
+    if pdftotext_bin:
+        try:
+            proc = subprocess.run(
+                [pdftotext_bin, "-", "-"],
+                input=data,
+                capture_output=True,
+                check=True,
+                timeout=20,
+            )
+            text = proc.stdout.decode("utf-8", errors="replace")
+            if text.strip():
+                return text
+        except Exception as exc:
+            raise ValueError(f"Échec de l'extraction de texte via pdftotext : {exc}") from exc
+
+    if PdfReader is None and not pdftotext_bin:
+        raise ValueError("Aucun extracteur PDF disponible (installez pypdf ou le binaire système pdftotext)")
+    return ""
+
+
+def load_candidates_from_path(input_path: Path) -> list[AttachmentCandidate]:
+    candidates: list[AttachmentCandidate] = []
+    if not input_path.exists():
+        raise FileNotFoundError(f"Chemin d'entrée introuvable : {input_path}")
+
+    if input_path.is_file() and zipfile.is_zipfile(input_path):
+        with zipfile.ZipFile(input_path, "r") as zf:
+            for member in zf.infolist():
+                if member.is_dir():
+                    continue
+                filename = Path(member.filename).name
+                if not filename.lower().endswith(".pdf"):
+                    continue
+                data = zf.read(member)
+                date_str = f"{member.date_time[0]:04d}-{member.date_time[1]:02d}-{member.date_time[2]:02d}"
+                candidates.append(
+                    AttachmentCandidate(
+                        message_id=f"zip_{Path(member.filename).stem}",
+                        message_date=date_str,
+                        filename=filename,
+                        data=data,
+                    )
+                )
+    elif input_path.is_file() and input_path.suffix.lower() == ".pdf":
+        data = input_path.read_bytes()
+        candidates.append(
+            AttachmentCandidate(
+                message_id=input_path.stem,
+                message_date="local",
+                filename=input_path.name,
+                data=data,
+            )
+        )
+    elif input_path.is_dir():
+        for file in sorted(input_path.glob("*.pdf")):
+            data = file.read_bytes()
+            candidates.append(
+                AttachmentCandidate(
+                    message_id=file.stem,
+                    message_date="local",
+                    filename=file.name,
+                    data=data,
+                )
+            )
+    else:
+        raise ValueError(
+            f"Type d'entrée non pris en charge (attendu : fichier .zip, fichier .pdf ou dossier) : {input_path}"
+        )
+    return candidates
 
 
 def authenticate(credentials_path: Path, token_path: Path, reauth: bool = False):
@@ -427,15 +655,14 @@ def next_review_path(review_dir: Path, candidate: AttachmentCandidate) -> Path:
 def process_candidates(
     candidates: Iterable[AttachmentCandidate],
     output_dir: Path,
-    target_month: int,
-    target_year: int,
+    target_month: int | None,
+    target_year: int | None,
     dry_run: bool,
-    employee_name_override: str | None,
-    year_digits: int,
+    employer_name_override: str | None = None,
+    year_digits: int = 4,
+    naming_format: str = "YYYY-MM",
 ) -> tuple[int, int, int]:
     saved = skipped = review = 0
-    output_year_dir = output_dir / str(target_year)
-    review_dir = output_year_dir / "A_VERIFIER"
     # Avoid treating multiple duplicate copies of the same PDF as conflicts.
     seen_hashes: set[str] = set()
     planned_destinations: dict[str, str] = {}
@@ -448,12 +675,14 @@ def process_candidates(
             continue
         seen_hashes.add(digest)
 
+        default_year_str = str(target_year) if target_year else "NON_CLASSE"
+        fallback_review_dir = output_dir / default_year_str / "A_VERIFIER"
+
         try:
             pdf_text = read_pdf_text(candidate.data)
         except Exception as exc:
             print(f"À VÉRIFIER : {candidate.filename} — lecture PDF impossible : {exc}")
-            # A non-readable PDF may still be relevant; preserve it for manual review.
-            destination = next_review_path(review_dir, candidate)
+            destination = next_review_path(fallback_review_dir, candidate)
             if dry_run:
                 print(f"  -> prévoir {destination}")
             else:
@@ -465,32 +694,7 @@ def process_candidates(
         period = extract_pay_period(pdf_text)
         if not period:
             print(f"À VÉRIFIER : {candidate.filename} — période de paie introuvable dans le PDF")
-            destination = next_review_path(review_dir, candidate)
-            if dry_run:
-                print(f"  -> prévoir {destination}")
-            else:
-                write_private_file(destination, candidate.data)
-                print(f"  -> conservé dans {destination}")
-            review += 1
-            continue
-        if (period.start.month, period.start.year) != (target_month, target_year) or (
-            period.end.month, period.end.year
-        ) != (target_month, target_year):
-            print(
-                f"IGNORÉ : {candidate.filename} — période détectée "
-                f"{period.start:%d/%m/%Y} au {period.end:%d/%m/%Y}, "
-                f"cible {target_month:02d}/{target_year}"
-            )
-            skipped += 1
-            continue
-
-        employee_name = employee_name_override or extract_employee_name(pdf_text)
-        if not employee_name:
-            print(
-                f"À VÉRIFIER : {candidate.filename} — période correcte, "
-                "mais nom/prénom du salarié non reconnu"
-            )
-            destination = next_review_path(review_dir, candidate)
+            destination = next_review_path(fallback_review_dir, candidate)
             if dry_run:
                 print(f"  -> prévoir {destination}")
             else:
@@ -499,7 +703,48 @@ def process_candidates(
             review += 1
             continue
 
-        filename = expected_filename(target_year, target_month, employee_name, year_digits)
+        file_year = period.start.year
+        file_month = period.start.month
+
+        if target_month is not None and target_year is not None:
+            if (file_month, file_year) != (target_month, target_year) or (
+                period.end.month, period.end.year
+            ) != (target_month, target_year):
+                print(
+                    f"IGNORÉ : {candidate.filename} — période détectée "
+                    f"{period.start:%d/%m/%Y} au {period.end:%d/%m/%Y}, "
+                    f"cible {target_month:02d}/{target_year}"
+                )
+                skipped += 1
+                continue
+
+        output_year_dir = output_dir / str(file_year)
+        review_dir = output_year_dir / "A_VERIFIER"
+
+        # Règle métier : l'identifiant de classement est exclusivement l'employeur.
+        # Ne jamais utiliser l'identité du salarié en repli.
+        employer_name = employer_name_override or extract_employer_name(pdf_text)
+        if not employer_name:
+            print(
+                f"À VÉRIFIER : {candidate.filename} — période {period.start:%d/%m/%Y} au {period.end:%d/%m/%Y}, "
+                "mais employeur non identifié dans le PDF (l'identité du salarié n'est jamais utilisée en repli)"
+            )
+            destination = next_review_path(review_dir, candidate)
+            if dry_run:
+                print(f"  -> prévoir {destination}")
+            else:
+                write_private_file(destination, candidate.data)
+                print(f"  -> conservé dans {destination}")
+            review += 1
+            continue
+
+        filename = expected_filename(
+            file_year,
+            file_month,
+            employer_name,
+            year_digits=year_digits,
+            naming_format=naming_format,
+        )
         destination = output_year_dir / filename
         destination_key = str(destination.resolve())
         if destination_key in planned_destinations and planned_destinations[destination_key] != digest:
@@ -535,7 +780,7 @@ def process_candidates(
         if dry_run:
             print(
                 f"OK : période {period.start:%d/%m/%Y} au {period.end:%d/%m/%Y} | "
-                f"nom prévu : {destination} | courriel : {candidate.message_date}"
+                f"employeur : {employer_name} | fichier prévu : {destination}"
             )
         else:
             try:
@@ -557,16 +802,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     month, year = previous_month()
     parser = argparse.ArgumentParser(
         prog="fiche-paye",
-        description="Récupère les PDF de paie du mois précédent depuis Gmail et les classe localement.",
+        description="Récupère les PDF de paie depuis Gmail ou une archive/dossier local et les classe localement par employeur.",
     )
+    parser.add_argument("--input", type=Path, help="chemin vers une archive ZIP, un dossier ou un fichier PDF local")
     parser.add_argument("--dry-run", action="store_true", help="afficher les actions sans écrire de PDF")
-    parser.add_argument("--month", metavar="AAAA-MM", help="mois à rechercher (par défaut : mois précédent)")
+    parser.add_argument("--month", metavar="AAAA-MM", help="mois cible à rechercher (ex: 2026-10 ; optionnel avec --input)")
     parser.add_argument("--sender", default=DEFAULT_SENDER, help=f"expéditeur Gmail (défaut : {DEFAULT_SENDER})")
-    parser.add_argument("--output", type=Path, default=default_output_dir(), help="dossier de classement")
+    parser.add_argument("--output", type=Path, default=default_output_dir(), help="dossier de classement racine")
     parser.add_argument("--credentials", type=Path, default=config_dir() / "credentials.json", help="JSON OAuth Google")
     parser.add_argument("--token", type=Path, default=config_dir() / "token.json", help="fichier local du jeton OAuth")
-    parser.add_argument("--employee-name", help="nom au format NOM-Prénom, utilisé si le PDF ne permet pas de le détecter")
-    parser.add_argument("--year-digits", type=int, choices=(1, 2, 4), default=1, help="chiffres de l'année dans le nom (défaut : 1 ; ex. 09-6_) ")
+    parser.add_argument("--employer-name", help="nom de l'employeur au format NOM-Prénom (force l'identité si non détectée)")
+    parser.add_argument("--employee-name", help=argparse.SUPPRESS)
+    parser.add_argument("--naming-format", choices=("YYYY-MM", "MM-Y"), default="YYYY-MM", help="format de nommage : YYYY-MM (ex: 2026-10_NOM-Prénom.pdf, défaut) ou MM-Y (ex: 10-6_NOM-Prénom.pdf)")
+    parser.add_argument("--year-digits", type=int, choices=(1, 2, 4), default=4, help="chiffres de l'année pour le format MM-Y (défaut : 4)")
     parser.add_argument("--reauth", action="store_true", help="supprimer le jeton local et redemander l'autorisation Google")
     parser.add_argument("--max-age-days", type=int, default=180, help="limite de recherche Gmail en jours (défaut : 180)")
     args = parser.parse_args(argv)
@@ -578,8 +826,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.target_year, args.target_month = int(match.group(1)), int(match.group(2))
         if not 1 <= args.target_month <= 12:
             parser.error("le mois doit être compris entre 01 et 12")
+    elif args.input:
+        # En mode local, sans --month explicite, on classe selon la période lue dans chaque PDF
+        args.target_month, args.target_year = None, None
     else:
         args.target_month, args.target_year = month, year
+
+    if args.employee_name and not args.employer_name:
+        args.employer_name = args.employee_name
 
     if args.max_age_days < 1 or args.max_age_days > 3650:
         parser.error("--max-age-days doit être compris entre 1 et 3650")
@@ -590,14 +844,57 @@ def main(argv: list[str] | None = None) -> int:
     # Files containing payslips and local OAuth tokens should default to owner-only.
     os.umask(0o077)
     args = parse_args(argv)
-    if DEPENDENCY_ERROR:
-        missing = DEPENDENCY_ERROR.split("'")[1] if "'" in DEPENDENCY_ERROR else DEPENDENCY_ERROR
+
+    if args.input:
+        print(f"Source locale : {args.input}")
+        if args.target_month and args.target_year:
+            print(f"Filtre période : {args.target_month:02d}/{args.target_year}")
+        else:
+            print("Filtre période : automatique (selon la période détectée dans chaque bulletin)")
+        print(f"Format de nommage : {args.naming_format}")
+        print(f"Destination : {args.output}")
+        if args.dry_run:
+            print("Mode simulation : aucun fichier PDF ne sera écrit.\n")
+
+        try:
+            candidates = load_candidates_from_path(args.input)
+            print(f"Documents PDF trouvés : {len(candidates)}\n")
+            if not candidates:
+                print("Aucun bulletin PDF trouvé dans la source fournie.")
+                return 0
+            saved, skipped, review = process_candidates(
+                candidates=candidates,
+                output_dir=args.output,
+                target_month=args.target_month,
+                target_year=args.target_year,
+                dry_run=args.dry_run,
+                employer_name_override=args.employer_name,
+                year_digits=args.year_digits,
+                naming_format=args.naming_format,
+            )
+            verb = "à classer" if args.dry_run else "classé(s)"
+            print(f"\nBilan : {saved} {verb}, {skipped} ignoré(s), {review} à vérifier.")
+            if review:
+                print(f"Les PDF nécessitant une vérification sont rangés dans les sous-dossiers 'A_VERIFIER'.")
+            return 0
+        except FileNotFoundError as exc:
+            print(f"ERREUR : {exc}", file=sys.stderr)
+            return 2
+        except Exception as exc:
+            print(f"ERREUR : {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 1
+
+    # Mode Gmail
+    if GMAIL_DEPENDENCY_ERROR:
+        missing = GMAIL_DEPENDENCY_ERROR.split("'")[1] if "'" in GMAIL_DEPENDENCY_ERROR else GMAIL_DEPENDENCY_ERROR
         print(
-            f"Dépendance manquante ({missing}). Installe le projet avec :\n"
-            "  python -m pip install -e .",
+            f"Dépendance manquante ({missing}) requise pour l'accès Gmail. Installe le projet avec :\n"
+            "  python -m pip install -e .\n"
+            "Ou utilisez --input pour traiter des fichiers locaux ou des archives ZIP.",
             file=sys.stderr,
         )
         return 2
+
     first_of_month = date(args.target_year, args.target_month, 1)
     query_start = first_of_month.strftime("%Y/%m/%d")
     query = f"from:{args.sender} has:attachment filename:pdf after:{query_start} newer_than:{args.max_age_days}d"
@@ -620,13 +917,14 @@ def main(argv: list[str] | None = None) -> int:
         candidates = list(fetch_pdf_attachments(service, message_ids))
         print(f"Pièces jointes PDF récupérées en mémoire : {len(candidates)}\n")
         saved, skipped, review = process_candidates(
-            candidates,
-            args.output,
-            args.target_month,
-            args.target_year,
-            args.dry_run,
-            args.employee_name,
-            args.year_digits,
+            candidates=candidates,
+            output_dir=args.output,
+            target_month=args.target_month,
+            target_year=args.target_year,
+            dry_run=args.dry_run,
+            employer_name_override=args.employer_name,
+            year_digits=args.year_digits,
+            naming_format=args.naming_format,
         )
         verb = "à classer" if args.dry_run else "classé(s)"
         print(f"\nBilan : {saved} {verb}, {skipped} ignoré(s), {review} à vérifier.")

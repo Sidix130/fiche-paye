@@ -42,433 +42,178 @@ The content is organized as follows:
 </file_summary>
 
 <directory_structure>
-.gitignore
-deploy-test.sh
-fiche_paye.py
-install.sh
-pyproject.toml
-README.md
+__init__.py
+models.py
+namer.py
 </directory_structure>
 
 <files>
 This section contains the contents of the repository's files.
 
-<file path=".gitignore">
-.venv/
-__pycache__/
-*.py[cod]
-credentials.json
-token.json
-.env
-# credentials.json.gpg peut être commité (chiffré). Ne pas commiter credentials.json.
-</file>
+<file path="__init__.py">
+"""Package fiche_paye - Classement automatisé et local des bulletins de paie.
 
-<file path="deploy-test.sh">
-#!/usr/bin/env bash
-# Déploie le projet fiche-paye sur Linux Mint et lance les tests unitaires à distance.
-# Cible prévue : gerard@192.168.1.178 ; empreinte ED25519 connue depuis l'installation SSH.
-set -Eeuo pipefail
-
-HOST="${FICHE_PAYE_HOST:-192.168.1.178}"
-REMOTE_USER="${FICHE_PAYE_USER:-gerard}"
-TARGET="${REMOTE_USER}@${HOST}"
-EXPECTED_ED25519_FP="SHA256:SAbDVVsNa3gG8ldCn0OqwkhZ0Bxqb5Ii9DItDww2uEA"
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$SCRIPT_DIR"
-SSH_DIR="$HOME/.ssh"
-SSH_KEY="$SSH_DIR/id_ed25519_fiche_paye_mint"
-KNOWN_HOSTS="$SSH_DIR/known_hosts"
-SCAN_FILE=""
-AGENT_STARTED=0
-
-fail() { printf '\nERREUR : %s\n' "$*" >&2; exit 1; }
-cleanup() {
-  if [[ "$AGENT_STARTED" -eq 1 && -n "${SSH_AGENT_PID:-}" ]]; then
-    ssh-agent -k >/dev/null 2>&1 || true
-  fi
-  if [[ -n "$SCAN_FILE" && -f "$SCAN_FILE" ]]; then rm -f -- "$SCAN_FILE"; fi
-}
-trap cleanup EXIT
-
-printf '\n=== Déploiement et test de fiche-paye sur Linux Mint ===\n\n'
-printf 'Machine cible : %s\n' "$TARGET"
-printf 'Empreinte ED25519 attendue : %s\n\n' "$EXPECTED_ED25519_FP"
-printf 'Ce script va :\n'
-printf '  1. vérifier l’identité SSH du PC du bas ;\n'
-printf '  2. configurer une clé SSH dédiée ;\n'
-printf '  3. installer les prérequis Python sur Linux Mint ;\n'
-printf '  4. transférer le code et lancer les tests.\n\n'
-printf 'Il ne transfère aucun identifiant Google, jeton OAuth ou bulletin de paie.\n'
-printf 'Il ne se connecte pas à Gmail et ne modifie aucun courriel.\n\n'
-read -r -p 'Continuer ? [O/n] ' answer
-case "${answer,,}" in n|non) printf 'Annulé.\n'; exit 0 ;; esac
-
-[[ -d "$PROJECT_DIR" ]] || fail "Dossier projet introuvable : $PROJECT_DIR. Vérifie que tu as extrait l’archive complète."
-for cmd in ssh ssh-keyscan ssh-keygen ssh-copy-id ssh-agent ssh-add tar awk; do
-  command -v "$cmd" >/dev/null 2>&1 || fail "Commande requise absente : $cmd. Sur CachyOS, installe openssh et tar avec pacman."
-done
-
-mkdir -p "$SSH_DIR"
-chmod 700 "$SSH_DIR"
-touch "$KNOWN_HOSTS"
-chmod 600 "$KNOWN_HOSTS"
-
-# Vérifie la clé d'hôte avant de l'ajouter à known_hosts. Le fingerprint vient
-# de la sortie d'installation OpenSSH fournie par l'utilisateur.
-SCAN_FILE="$(mktemp)"
-printf '\n[1/5] Vérification de l’identité SSH du PC du bas...\n'
-if ! ssh-keyscan -T 8 -t ed25519 "$HOST" >"$SCAN_FILE" 2>/dev/null; then
-  fail "Impossible de lire la clé SSH de $HOST. Vérifie que les deux PC sont sur le même réseau et que Linux Mint est allumé."
-fi
-SCANNED_FP="$(ssh-keygen -lf "$SCAN_FILE" -E sha256 2>/dev/null | awk 'NR==1 {print $2}')"
-[[ -n "$SCANNED_FP" ]] || fail "La clé SSH du PC cible n’a pas pu être identifiée."
-if [[ "$SCANNED_FP" != "$EXPECTED_ED25519_FP" ]]; then
-  printf 'Empreinte reçue : %s\n' "$SCANNED_FP" >&2
-  printf 'Empreinte attendue : %s\n' "$EXPECTED_ED25519_FP" >&2
-  fail "L’empreinte ne correspond pas au PC installé. Aucune connexion n’a été faite. Ne modifie pas la vérification sans contrôler l’empreinte directement sur Linux Mint."
-fi
-# Remplace seulement l'entrée de l'adresse visée après avoir vérifié son fingerprint.
-ssh-keygen -R "$HOST" -f "$KNOWN_HOSTS" >/dev/null 2>&1 || true
-cat "$SCAN_FILE" >> "$KNOWN_HOSTS"
-chmod 600 "$KNOWN_HOSTS"
-printf 'Identité vérifiée : %s\n' "$SCANNED_FP"
-
-printf '\n[2/5] Préparation de la clé SSH dédiée...\n'
-if [[ ! -f "$SSH_KEY" ]]; then
-  printf 'Une clé dédiée sera créée. Il est conseillé de choisir une phrase secrète.\n'
-  ssh-keygen -t ed25519 -a 64 -f "$SSH_KEY" -C "fiche-paye-cachyos-vers-linux-mint"
-elif [[ ! -f "$SSH_KEY.pub" ]]; then
-  printf 'Clé publique absente : reconstruction à partir de la clé privée existante.\n'
-  ssh-keygen -y -f "$SSH_KEY" > "$SSH_KEY.pub"
-  chmod 644 "$SSH_KEY.pub"
-fi
-chmod 600 "$SSH_KEY"
-chmod 644 "$SSH_KEY.pub"
-
-# Agent temporaire : permet de saisir la phrase secrète une fois par lancement.
-eval "$(ssh-agent -s)" >/dev/null
-AGENT_STARTED=1
-ssh-add "$SSH_KEY"
-
-printf '\n[3/5] Autorisation de la clé sur Linux Mint...\n'
-printf 'Si demandé, saisis le mot de passe du compte Linux Mint « %s ».\n' "$REMOTE_USER"
-ssh-copy-id -i "$SSH_KEY.pub" "$TARGET"
-ssh -o BatchMode=yes -o ConnectTimeout=10 "$TARGET" 'printf "Connexion SSH confirmée : "; id -un; printf "\nSystème : "; . /etc/os-release; printf "%s\n" "$PRETTY_NAME"'
-
-printf '\n[4/5] Installation des prérequis sur Linux Mint...\n'
-printf 'Saisis le mot de passe sudo de Linux Mint si demandé.\n'
-ssh -t "$TARGET" 'sudo apt-get update && sudo apt-get install -y --no-install-recommends python3 python3-venv python3-pip ca-certificates'
-
-printf '\n[5/5] Transfert du code, installation Python et tests...\n'
-tar \
-  --exclude='.venv' \
-  --exclude='__pycache__' \
-  --exclude='*.pyc' \
-  --exclude='credentials.json' \
-  --exclude='token.json' \
-  -czf - -C "$PROJECT_DIR" . \
-| ssh -o BatchMode=yes "$TARGET" 'mkdir -p "$HOME/.local/src/fiche-paye" && tar -xzf - -C "$HOME/.local/src/fiche-paye" --no-same-owner'
-
-ssh -o BatchMode=yes "$TARGET" 'bash -s' <<'REMOTE_SCRIPT'
-set -Eeuo pipefail
-SRC="$HOME/.local/src/fiche-paye"
-VENV="$HOME/.local/share/fiche-paye-venv"
-
-printf '\n--- Diagnostic cible ---\n'
-cat /etc/os-release | grep -E '^(PRETTY_NAME|VERSION_ID)=' || true
-printf 'Architecture : '; uname -m
-printf 'Python système : '; python3 --version
-printf 'Source transférée : %s\n' "$SRC"
-printf 'Environnement virtuel : %s\n' "$VENV"
-
-mkdir -p "$HOME/.local/share"
-if [[ ! -x "$VENV/bin/python" ]]; then
-  python3 -m venv "$VENV"
-fi
-"$VENV/bin/python" -m pip install --upgrade pip
-"$VENV/bin/python" -m pip install -e "$SRC"
-
-printf '\n--- Tests unitaires sur Linux Mint ---\n'
-"$VENV/bin/python" -m unittest discover -s "$SRC/tests" -v
-
-printf '\n--- Vérification de la commande ---\n'
-"$VENV/bin/fiche-paye" --help >/dev/null
-printf 'La commande fiche-paye démarre correctement (--help).\n'
-printf '\n--- État de la configuration Gmail (aucun secret affiché) ---\n'
-if [[ -s "$HOME/.config/fiche-paye/credentials.json" ]]; then
-  printf 'credentials.json : présent\n'
-else
-  printf 'credentials.json : absent (la configuration Google reste à faire sur la machine cible)\n'
-fi
-if [[ -s "$HOME/.config/fiche-paye/token.json" ]]; then
-  printf 'token.json : présent\n'
-else
-  printf 'token.json : absent (aucun test Gmail n’a été lancé)\n'
-fi
-printf '\nSUCCÈS : installation et tests unitaires terminés sur cette machine.\n'
-REMOTE_SCRIPT
-
-printf '\n============================================================\n'
-printf 'TERMINÉ : Linux Mint a été configuré et les tests ont été lancés.\n\n'
-printf 'Pour redéployer tes prochaines modifications, relance simplement :\n'
-printf '  cd "%s"\n  ./deploy-test.sh\n\n' "$SCRIPT_DIR"
-printf 'La commande sur Linux Mint est installée ici :\n  ~/.local/share/fiche-paye-venv/bin/fiche-paye\n'
-printf 'Les résultats ci-dessus concernent les tests unitaires ; le test Gmail réel reste séparé.\n'
-</file>
-
-<file path="fiche_paye.py">
-#!/usr/bin/env python3
-"""Fetch last month's payslip PDFs from Gmail and classify them locally.
-
-Gmail access is read-only. PDFs are never sent to an external service.
+Ce package expose les nouveaux modules du domaine (models, namer)
+et assure la continuité fonctionnelle avec les composants en cours de migration.
 """
 from __future__ import annotations
 
-import argparse
-import base64
-import hashlib
-import io
-import itertools
-import os
-import re
-import sys
-import unicodedata
-from collections.abc import Iterable
-from dataclasses import dataclass
-from datetime import date, datetime
+import importlib.util
 from pathlib import Path
 from typing import Any
 
-DEPENDENCY_ERROR: str | None = None
-try:
-    from google.auth.transport.requests import Request
-    from google.oauth2.credentials import Credentials
-    from google_auth_oauthlib.flow import InstalledAppFlow
-    from googleapiclient.discovery import build
-    from googleapiclient.errors import HttpError
-    from pypdf import PdfReader
-except ImportError as exc:  # Keep pure parsing helpers importable for unit tests.
-    DEPENDENCY_ERROR = str(exc)
-    Request = Credentials = InstalledAppFlow = build = HttpError = PdfReader = None  # type: ignore[misc]
+from fiche_paye.models import AttachmentCandidate, DocumentCandidate, PayPeriod
+from fiche_paye.namer import expected_filename, sanitize_filename_component
 
-SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
-DEFAULT_SENDER = "admin@ouihelp.fr"
-MAX_PDF_BYTES = 30 * 1024 * 1024
+__all__ = [
+    "AttachmentCandidate",
+    "DocumentCandidate",
+    "PayPeriod",
+    "expected_filename",
+    "sanitize_filename_component",
+]
 
-MONTHS_FR = {
-    "janvier": 1,
-    "fevrier": 2,
-    "mars": 3,
-    "avril": 4,
-    "mai": 5,
-    "juin": 6,
-    "juillet": 7,
-    "aout": 8,
-    "septembre": 9,
-    "octobre": 10,
-    "novembre": 11,
-    "decembre": 12,
-}
-MONTH_PATTERN = (
-    r"janvier|février|fevrier|mars|avril|mai|juin|juillet|août|aout|"
-    r"septembre|octobre|novembre|décembre|decembre"
-)
-DATE_PATTERN = rf"(?:\d{{1,2}}[./-]\d{{1,2}}[./-]\d{{4}}|\d{{1,2}}\s+(?:{MONTH_PATTERN})\s+\d{{4}})"
-PERIOD_PATTERN = re.compile(
-    rf"\bp[eé]riode\b.{{0,180}}?(?P<start>{DATE_PATTERN})\s*"
-    rf"(?:au|à|jusqu['’ ]?au|[-–—])\s*(?P<end>{DATE_PATTERN})",
-    re.IGNORECASE | re.DOTALL,
-)
+# Chargement du monolithe de transition et synchronisation bidirectionnelle
+_root_file = Path(__file__).resolve().parent.parent / "fiche_paye.py"
+_spec = importlib.util.spec_from_file_location("_legacy_monolith", _root_file)
+if _spec and _spec.loader:
+    _legacy = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_legacy)
+
+    # Export des fonctions non encore migrées dans ce package
+    for _k, _v in _legacy.__dict__.items():
+        if not _k.startswith("__") and _k not in globals():
+            globals()[_k] = _v
+
+    # Synchronisation pour que les patchs sur fiche_paye affectent directement l'exécution du monolithe
+    def _sync_read_pdf_text(data: bytes) -> str:
+        current = globals().get("read_pdf_text")
+        if current is not _sync_read_pdf_text:
+            return current(data)
+        return _legacy.read_pdf_text(data)
+
+    _legacy.read_pdf_text = _sync_read_pdf_text
+</file>
+
+<file path="models.py">
+"""Modèles de données du domaine pour le classement des fiches de paie.
+
+Structures immuables et indépendantes de la technologie d'acquisition.
+"""
+from __future__ import annotations
+
+import hashlib
+from dataclasses import dataclass, field
+from datetime import date
+from typing import Any
+
 
 @dataclass(frozen=True)
 class PayPeriod:
+    """Représente une période de paie avec dates de début et de fin.
+
+    Préserve rigoureusement les dates exactes sans perte d'information.
+    """
     start: date
     end: date
 
+    def __post_init__(self) -> None:
+        if self.start > self.end:
+            raise ValueError(
+                f"Période incohérente : début ({self.start}) postérieur à la fin ({self.end})"
+            )
+
+    @property
+    def year(self) -> int:
+        return self.start.year
+
+    @property
+    def month(self) -> int:
+        return self.start.month
+
+    @property
+    def is_single_month(self) -> bool:
+        """Indique si la période est entièrement contenue dans le même mois calendaire."""
+        return (self.start.year, self.start.month) == (self.end.year, self.end.month)
+
+
 @dataclass(frozen=True)
-class AttachmentCandidate:
-    message_id: str
-    message_date: str
+class DocumentCandidate:
+    """Représente un document PDF candidat issu d'une source quelconque (ZIP, dossier, Gmail...).
+
+    Indépendant de la technologie d'acquisition.
+    """
+    source_type: str
+    source_reference: str
     filename: str
     data: bytes
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.filename or not self.filename.strip():
+            raise ValueError("Le nom de fichier d'un DocumentCandidate ne peut pas être vide.")
+        if not self.data:
+            raise ValueError("Les données binaires d'un DocumentCandidate ne peuvent pas être vides.")
+
+    @property
+    def sha256(self) -> str:
+        """Calcule l'empreinte SHA-256 du document."""
+        return hashlib.sha256(self.data).hexdigest()
+
+    @property
+    def message_id(self) -> str:
+        """Alias de compatibilité pour le code attendant l'ancien AttachmentCandidate."""
+        return self.source_reference
+
+    @property
+    def message_date(self) -> str:
+        """Alias de compatibilité pour le code attendant l'ancien AttachmentCandidate."""
+        return str(self.metadata.get("message_date", "date inconnue"))
 
 
-def config_dir() -> Path:
-    root = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
-    return root / "fiche-paye"
+@dataclass(frozen=True)
+class AttachmentCandidate(DocumentCandidate):
+    """Sous-classe de transition assurant la compatibilité avec l'ancienne signature."""
 
+    def __init__(
+        self,
+        message_id: str,
+        message_date: str,
+        filename: str,
+        data: bytes,
+        source_type: str = "legacy",
+    ) -> None:
+        object.__setattr__(self, "source_type", source_type)
+        object.__setattr__(self, "source_reference", message_id)
+        object.__setattr__(self, "filename", filename)
+        object.__setattr__(self, "data", data)
+        object.__setattr__(self, "metadata", {"message_date": message_date})
+        self.__post_init__()
+</file>
 
-def default_output_dir() -> Path:
-    return Path.home() / "Documents" / "Fiches-de-paie"
+<file path="namer.py">
+"""Module de nommage pur et déterministe pour les bulletins de paie.
 
+Fonctions pures sans effet de bord : aucune I/O disque, aucun renommage physique.
+"""
+from __future__ import annotations
 
-def previous_month(reference: date | None = None) -> tuple[int, int]:
-    reference = reference or date.today()
-    if reference.month == 1:
-        return 12, reference.year - 1
-    return reference.month - 1, reference.year
-
-
-def normalize_for_matching(value: str) -> str:
-    value = unicodedata.normalize("NFKD", value)
-    value = "".join(ch for ch in value if not unicodedata.combining(ch))
-    return re.sub(r"\s+", " ", value).strip().lower()
-
-
-def parse_date_token(token: str) -> date | None:
-    token = token.strip().replace("’", "'")
-    for fmt in ("%d/%m/%Y", "%d.%m.%Y", "%d-%m-%Y"):
-        try:
-            return datetime.strptime(token, fmt).date()
-        except ValueError:
-            pass
-
-    match = re.fullmatch(r"(\d{1,2})\s+([a-zA-Zéèêëàâäîïôöùûüç]+)\s+(\d{4})", token, re.IGNORECASE)
-    if match:
-        day = int(match.group(1))
-        month_name = normalize_for_matching(match.group(2))
-        year = int(match.group(3))
-        month = MONTHS_FR.get(month_name)
-        if month:
-            try:
-                return date(year, month, day)
-            except ValueError:
-                return None
-    return None
-
-
-def extract_pay_period(pdf_text: str) -> PayPeriod | None:
-    """Extract dates only from a labelled 'période' range; do not guess from email date."""
-    match = PERIOD_PATTERN.search(pdf_text)
-    if not match:
-        # A few PDFs put the phrase between the dates in a separate line. This
-        # second pass accepts only a short, explicit date range near 'période'.
-        text = re.sub(r"[ \t]+", " ", pdf_text)
-        labelled = re.search(r"\bp[eé]riode\b", text, re.IGNORECASE)
-        if labelled:
-            chunk = text[labelled.start(): labelled.start() + 320]
-            dates = list(re.finditer(DATE_PATTERN, chunk, re.IGNORECASE))
-            for left, right in itertools.pairwise(dates):
-                between = chunk[left.end():right.start()]
-                if re.search(r"\b(?:au|à|jusqu['’ ]?au)\b|[-–—]", between, re.IGNORECASE):
-                    start = parse_date_token(left.group(0))
-                    end = parse_date_token(right.group(0))
-                    if start and end:
-                        return PayPeriod(start, end)
-        return None
-
-    start = parse_date_token(match.group("start"))
-    end = parse_date_token(match.group("end"))
-    if not start or not end or end < start:
-        return None
-    return PayPeriod(start, end)
-
-
-def _clean_field_value(value: str) -> str:
-    value = re.split(
-        r"\s{2,}|\b(?:pr[eé]nom|nom|n[o°]\s*ss|matricule|n[o°]\s*de s[eé]curit[eé])\s*[:#]",
-        value,
-        maxsplit=1,
-        flags=re.IGNORECASE,
-    )[0]
-    value = re.sub(r"\s+", " ", value).strip(" \t:;-|,.")
-    value = re.sub(r"^(?:M(?:me|lle|r)?\.?|Madame|Monsieur)\s+", "", value, flags=re.IGNORECASE)
-    return value
-
-
-def _clean_name_piece(value: str) -> str:
-    value = _clean_field_value(value)
-    value = re.sub(r"[^A-Za-zÀ-ÖØ-öø-ÿÆæŒœ'’ -]", "", value)
-    value = re.sub(r"\s+", " ", value).strip(" -'")
-    return value
-
-
-def _format_surname(surname: str) -> str:
-    return "-".join(part.upper() for part in re.split(r"[ -]+", surname.strip()) if part)
-
-
-def _format_given_names(given_names: str) -> str:
-    parts = re.split(r"([ -]+)", given_names.strip())
-    formatted: list[str] = []
-    for part in parts:
-        if part and re.fullmatch(r"[ -]+", part):
-            formatted.append(part)
-        elif part:
-            formatted.append(part[:1].upper() + part[1:].lower())
-    return "".join(formatted)
-
-
-def _safe_name_pair(surname: str, given_names: str) -> str | None:
-    surname = _clean_name_piece(surname)
-    given_names = _clean_name_piece(given_names)
-    if not surname or not given_names:
-        return None
-    if len(surname) > 50 or len(given_names) > 50:
-        return None
-    return f"{_format_surname(surname)}-{_format_given_names(given_names)}"
-
-
-def extract_employee_name(pdf_text: str) -> str | None:
-    """Return NOM-Prénom only when the PDF has reasonably explicit labels.
-
-    Payslip layouts differ. For ambiguous layouts the caller should use
-    --employee-name or manually inspect the PDF instead of guessing.
-    """
-    text = pdf_text.replace("\x00", "\n")
-
-    # Most reliable case: separately labelled surname and given name fields.
-    surname_patterns = [
-        r"(?im)^\s*(?:nom\s+de\s+famille|nom\s+du\s+salari[eé](?:e)?|nom\s+de\s+la\s+salari[eé]e)\s*[:\-]\s*([^\r\n]{1,60})",
-        r"(?im)^\s*nom\s*[:\-]\s*([^\r\n]{1,60})",
-    ]
-    given_patterns = [
-        r"(?im)^\s*pr[eé]nom(?:s)?\s*[:\-]\s*([^\r\n]{1,60})",
-        r"(?im)^\s*pr[eé]nom\s+du\s+salari[eé](?:e)?\s*[:\-]\s*([^\r\n]{1,60})",
-    ]
-    surname = None
-    given = None
-    for pattern in surname_patterns:
-        m = re.search(pattern, text)
-        if m:
-            surname = _clean_name_piece(m.group(1))
-            break
-    for pattern in given_patterns:
-        m = re.search(pattern, text)
-        if m:
-            given = _clean_name_piece(m.group(1))
-            break
-    if surname and given:
-        pair = _safe_name_pair(surname, given)
-        if pair:
-            return pair
-
-    # A combined field explicitly labelled for the employee.
-    combined_patterns = [
-        r"(?im)^\s*(?:nom\s+et\s+pr[eé]nom(?:s)?\s+du\s+salari[eé](?:e)?|nom\s+et\s+pr[eé]nom(?:s)?\s+de\s+la\s+salari[eé]e)\s*[:\-]?\s*([^\r\n]{3,90})",
-        r"(?im)^\s*identit[eé]\s+du\s+salari[eé](?:e)?\s*[:\-]\s*([^\r\n]{3,90})",
-    ]
-    for pattern in combined_patterns:
-        m = re.search(pattern, text)
-        if not m:
-            continue
-        value = _clean_name_piece(m.group(1))
-        tokens = value.split()
-        if len(tokens) >= 2:
-            # A field labelled 'Nom et prénom' is interpreted in that order.
-            return _safe_name_pair(tokens[0], " ".join(tokens[1:]))
-
-    # Generic 'Nom et prénom' only when it is clearly a field, not prose.
-    m = re.search(r"(?im)^\s*nom\s+et\s+pr[eé]nom(?:s)?\s*[:\-]\s*([^\r\n]{3,90})", text)
-    if m:
-        value = _clean_name_piece(m.group(1))
-        tokens = value.split()
-        if len(tokens) >= 2:
-            return _safe_name_pair(tokens[0], " ".join(tokens[1:]))
-
-    return None
+import re
 
 
 def sanitize_filename_component(value: str) -> str:
+    """Nettoie et normalise une composante de nom de fichier.
+
+    Règles :
+    - Remplacement de '&' par '-et-' (non destructif pour les raisons sociales)
+    - Remplacement des séparateurs de chemin '/' et '\\' par des tirets
+    - Suppression des caractères interdits sur les systèmes de fichiers (POSIX / Windows)
+    - Normalisation des espaces consécutifs en un seul tiret
+    - Réduction des tirets successifs
+    """
+    if not value or not value.strip():
+        return "inconnu"
+    value = value.replace("&", "-et-")
     value = value.replace("/", "-").replace("\\", "-")
     value = re.sub(r"[\x00-\x1f<>:\"|?*]", "", value)
     value = re.sub(r"\s+", "-", value.strip())
@@ -476,726 +221,39 @@ def sanitize_filename_component(value: str) -> str:
     return value.strip(".- ") or "inconnu"
 
 
-def expected_filename(year: int, month: int, employee_name: str, year_digits: int = 1) -> str:
-    if year_digits not in (1, 2, 4):
-        raise ValueError("year_digits doit être 1, 2 ou 4")
-    year_text = str(year)[-year_digits:]
-    safe_name = sanitize_filename_component(employee_name)
-    return f"{month:02d}-{year_text}_{safe_name}.pdf"
+def expected_filename(
+    year: int,
+    month: int,
+    employer_name: str,
+    year_digits: int = 4,
+    naming_format: str = "YYYY-MM",
+) -> str:
+    """Construit le nom de fichier cible pour un bulletin.
 
+    Contrat :
+    - Par défaut : format ISO 'AAAA-MM_NOM-Prénom.pdf' (naming_format="YYYY-MM")
+    - Format rétrocompatible : 'MM-Y_NOM-Prénom.pdf' (naming_format="MM-Y")
+    - Fonction pure : déterministe et sans effet de bord.
+    """
+    if not 1 <= month <= 12:
+        raise ValueError(f"Mois invalide ({month}) : doit être compris entre 1 et 12")
+    if year < 1900 or year > 2100:
+        raise ValueError(f"Année invalide ({year}) : doit être comprise entre 1900 et 2100")
 
-def read_pdf_text(data: bytes) -> str:
-    if not data.startswith(b"%PDF-"):
-        raise ValueError("la pièce jointe ne semble pas être un PDF")
-    if len(data) > MAX_PDF_BYTES:
-        raise ValueError(f"PDF trop volumineux ({len(data) // (1024 * 1024)} Mio, limite 30 Mio)")
-    reader = PdfReader(io.BytesIO(data), strict=False)
-    if reader.is_encrypted:
-        try:
-            unlocked = reader.decrypt("")
-        except Exception as exc:
-            raise ValueError("PDF chiffré ou protégé par mot de passe") from exc
-        if not unlocked:
-            raise ValueError("PDF chiffré ou protégé par mot de passe")
-    pages: list[str] = []
-    for page in reader.pages:
-        try:
-            pages.append(page.extract_text() or "")
-        except Exception:
-            pages.append("")
-    return "\n".join(pages)
+    safe_name = sanitize_filename_component(employer_name)
 
+    if naming_format == "YYYY-MM":
+        return f"{year:04d}-{month:02d}_{safe_name}.pdf"
 
-def authenticate(credentials_path: Path, token_path: Path, reauth: bool = False):
-    token_path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        token_path.parent.chmod(0o700)
-    except OSError:
-        pass
-    if reauth and token_path.exists():
-        token_path.unlink()
+    if naming_format == "MM-Y":
+        if year_digits not in (1, 2, 4):
+            raise ValueError("year_digits doit être 1, 2 ou 4 pour le format MM-Y")
+        year_text = str(year)[-year_digits:]
+        return f"{month:02d}-{year_text}_{safe_name}.pdf"
 
-    creds = None
-    if token_path.exists():
-        try:
-            creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
-        except Exception:
-            creds = None
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            if not credentials_path.is_file():
-                raise FileNotFoundError(
-                    f"Fichier OAuth introuvable : {credentials_path}\n"
-                    "Crée un identifiant OAuth de type Application de bureau dans Google Cloud, "
-                    "active l'API Gmail et place le JSON téléchargé à cet emplacement. "
-                    "Voir README.md."
-                )
-            flow = InstalledAppFlow.from_client_secrets_file(str(credentials_path), SCOPES)
-            creds = flow.run_local_server(port=0, open_browser=True)
-        token_path.write_text(creds.to_json(), encoding="utf-8")
-        try:
-            token_path.chmod(0o600)
-        except OSError:
-            pass
-    return creds
-
-
-def list_message_ids(service, query: str) -> list[str]:
-    ids: list[str] = []
-    page_token = None
-    while True:
-        result = service.users().messages().list(
-            userId="me", q=query, maxResults=100, pageToken=page_token
-        ).execute()
-        ids.extend(item["id"] for item in result.get("messages", []))
-        page_token = result.get("nextPageToken")
-        if not page_token:
-            break
-    return ids
-
-
-def walk_parts(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
-    stack = [payload]
-    while stack:
-        part = stack.pop()
-        yield part
-        # Reverse keeps the MIME sequence order when using a stack.
-        stack.extend(reversed(part.get("parts", []) or []))
-
-
-def decode_attachment(service, message_id: str, part: dict[str, Any]) -> bytes | None:
-    body = part.get("body") or {}
-    data = body.get("data")
-    attachment_id = body.get("attachmentId")
-    if not data and attachment_id:
-        attachment = service.users().messages().attachments().get(
-            userId="me", messageId=message_id, id=attachment_id
-        ).execute()
-        data = attachment.get("data")
-    if not data:
-        return None
-    encoded = data.encode("ascii")
-    encoded += b"=" * (-len(encoded) % 4)
-    return base64.urlsafe_b64decode(encoded)
-
-
-def safe_attachment_filename(name: str) -> str:
-    name = Path(name or "piece-jointe.pdf").name
-    name = re.sub(r"[^\w.() éèêëàâäîïôöùûüçÉÈÊËÀÂÄÎÏÔÖÙÛÜÇ'’-]+", "_", name, flags=re.UNICODE)
-    name = name.strip("._ ")
-    return name or "piece-jointe.pdf"
-
-
-def fetch_pdf_attachments(service, message_ids: list[str]) -> Iterable[AttachmentCandidate]:
-    for message_id in message_ids:
-        try:
-            msg = service.users().messages().get(
-                userId="me", id=message_id, format="full"
-            ).execute()
-        except HttpError as exc:
-            print(f"AVERTISSEMENT : message Gmail {message_id} inaccessible : {exc}", file=sys.stderr)
-            continue
-        payload = msg.get("payload") or {}
-        internal_ms = int(msg.get("internalDate", "0") or 0)
-        message_date = datetime.fromtimestamp(internal_ms / 1000).astimezone().date().isoformat() if internal_ms else "date inconnue"
-        for part in walk_parts(payload):
-            filename = part.get("filename", "")
-            mime_type = (part.get("mimeType") or "").lower()
-            if not filename or not (filename.lower().endswith(".pdf") or mime_type == "application/pdf"):
-                continue
-            try:
-                data = decode_attachment(service, message_id, part)
-                if data:
-                    yield AttachmentCandidate(message_id, message_date, safe_attachment_filename(filename), data)
-            except Exception as exc:
-                print(f"AVERTISSEMENT : pièce jointe ignorée ({safe_attachment_filename(filename)}) : {exc}", file=sys.stderr)
-
-
-def sha256(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
-
-def write_private_file(path: Path, data: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    try:
-        path.parent.chmod(0o700)
-    except OSError:
-        pass
-    # Exclusive creation prevents accidental overwrites, including race conditions.
-    with path.open("xb") as f:
-        f.write(data)
-    try:
-        path.chmod(0o600)
-    except OSError:
-        pass
-
-
-def next_review_path(review_dir: Path, candidate: AttachmentCandidate) -> Path:
-    base = sanitize_filename_component(Path(candidate.filename).stem)
-    suffix = candidate.message_id[:10]
-    path = review_dir / f"A_VERIFIER_{suffix}_{base}.pdf"
-    index = 2
-    while path.exists():
-        path = review_dir / f"A_VERIFIER_{suffix}_{base}_{index}.pdf"
-        index += 1
-    return path
-
-
-def process_candidates(
-    candidates: Iterable[AttachmentCandidate],
-    output_dir: Path,
-    target_month: int,
-    target_year: int,
-    dry_run: bool,
-    employee_name_override: str | None,
-    year_digits: int,
-) -> tuple[int, int, int]:
-    saved = skipped = review = 0
-    output_year_dir = output_dir / str(target_year)
-    review_dir = output_year_dir / "A_VERIFIER"
-    # Avoid treating multiple duplicate copies of the same PDF as conflicts.
-    seen_hashes: set[str] = set()
-    planned_destinations: dict[str, str] = {}
-
-    for candidate in candidates:
-        digest = sha256(candidate.data)
-        if digest in seen_hashes:
-            print(f"DOUBLON ignoré : {candidate.filename} (même contenu déjà traité)")
-            skipped += 1
-            continue
-        seen_hashes.add(digest)
-
-        try:
-            pdf_text = read_pdf_text(candidate.data)
-        except Exception as exc:
-            print(f"À VÉRIFIER : {candidate.filename} — lecture PDF impossible : {exc}")
-            # A non-readable PDF may still be relevant; preserve it for manual review.
-            destination = next_review_path(review_dir, candidate)
-            if dry_run:
-                print(f"  -> prévoir {destination}")
-            else:
-                write_private_file(destination, candidate.data)
-                print(f"  -> conservé dans {destination}")
-            review += 1
-            continue
-
-        period = extract_pay_period(pdf_text)
-        if not period:
-            print(f"À VÉRIFIER : {candidate.filename} — période de paie introuvable dans le PDF")
-            destination = next_review_path(review_dir, candidate)
-            if dry_run:
-                print(f"  -> prévoir {destination}")
-            else:
-                write_private_file(destination, candidate.data)
-                print(f"  -> conservé dans {destination}")
-            review += 1
-            continue
-        if (period.start.month, period.start.year) != (target_month, target_year) or (
-            period.end.month, period.end.year
-        ) != (target_month, target_year):
-            print(
-                f"IGNORÉ : {candidate.filename} — période détectée "
-                f"{period.start:%d/%m/%Y} au {period.end:%d/%m/%Y}, "
-                f"cible {target_month:02d}/{target_year}"
-            )
-            skipped += 1
-            continue
-
-        employee_name = employee_name_override or extract_employee_name(pdf_text)
-        if not employee_name:
-            print(
-                f"À VÉRIFIER : {candidate.filename} — période correcte, "
-                "mais nom/prénom du salarié non reconnu"
-            )
-            destination = next_review_path(review_dir, candidate)
-            if dry_run:
-                print(f"  -> prévoir {destination}")
-            else:
-                write_private_file(destination, candidate.data)
-                print(f"  -> conservé dans {destination}")
-            review += 1
-            continue
-
-        filename = expected_filename(target_year, target_month, employee_name, year_digits)
-        destination = output_year_dir / filename
-        destination_key = str(destination.resolve())
-        if destination_key in planned_destinations and planned_destinations[destination_key] != digest:
-            print(f"CONFLIT : plusieurs PDF différents correspondent à {destination} ; aucun écrasement")
-            review_path = next_review_path(review_dir, candidate)
-            if dry_run:
-                print(f"  -> prévoir {review_path}")
-            else:
-                write_private_file(review_path, candidate.data)
-                print(f"  -> version supplémentaire conservée dans {review_path}")
-            review += 1
-            continue
-        planned_destinations[destination_key] = digest
-        if destination.exists():
-            try:
-                existing_hash = sha256(destination.read_bytes())
-            except OSError:
-                existing_hash = ""
-            if existing_hash == digest:
-                print(f"DÉJÀ CLASSÉ : {destination}")
-                skipped += 1
-                continue
-            print(f"CONFLIT : {destination} existe avec un contenu différent ; aucun écrasement")
-            review_path = next_review_path(review_dir, candidate)
-            if dry_run:
-                print(f"  -> prévoir {review_path}")
-            else:
-                write_private_file(review_path, candidate.data)
-                print(f"  -> nouvelle version conservée dans {review_path}")
-            review += 1
-            continue
-
-        if dry_run:
-            print(
-                f"OK : période {period.start:%d/%m/%Y} au {period.end:%d/%m/%Y} | "
-                f"nom prévu : {destination} | courriel : {candidate.message_date}"
-            )
-        else:
-            try:
-                write_private_file(destination, candidate.data)
-                print(f"CLASSÉ : {destination}")
-            except FileExistsError:
-                print(f"CONFLIT : {destination} a été créé entre-temps ; aucun écrasement")
-                review_path = next_review_path(review_dir, candidate)
-                write_private_file(review_path, candidate.data)
-                print(f"  -> conservé dans {review_path}")
-                review += 1
-                continue
-        saved += 1
-
-    return saved, skipped, review
-
-
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    month, year = previous_month()
-    parser = argparse.ArgumentParser(
-        prog="fiche-paye",
-        description="Récupère les PDF de paie du mois précédent depuis Gmail et les classe localement.",
+    raise ValueError(
+        f"Format de nommage non reconnu : {naming_format!r} (valeurs acceptées : 'YYYY-MM', 'MM-Y')"
     )
-    parser.add_argument("--dry-run", action="store_true", help="afficher les actions sans écrire de PDF")
-    parser.add_argument("--month", metavar="AAAA-MM", help="mois à rechercher (par défaut : mois précédent)")
-    parser.add_argument("--sender", default=DEFAULT_SENDER, help=f"expéditeur Gmail (défaut : {DEFAULT_SENDER})")
-    parser.add_argument("--output", type=Path, default=default_output_dir(), help="dossier de classement")
-    parser.add_argument("--credentials", type=Path, default=config_dir() / "credentials.json", help="JSON OAuth Google")
-    parser.add_argument("--token", type=Path, default=config_dir() / "token.json", help="fichier local du jeton OAuth")
-    parser.add_argument("--employee-name", help="nom au format NOM-Prénom, utilisé si le PDF ne permet pas de le détecter")
-    parser.add_argument("--year-digits", type=int, choices=(1, 2, 4), default=1, help="chiffres de l'année dans le nom (défaut : 1 ; ex. 09-6_) ")
-    parser.add_argument("--reauth", action="store_true", help="supprimer le jeton local et redemander l'autorisation Google")
-    parser.add_argument("--max-age-days", type=int, default=180, help="limite de recherche Gmail en jours (défaut : 180)")
-    args = parser.parse_args(argv)
-
-    if args.month:
-        match = re.fullmatch(r"(\d{4})-(\d{2})", args.month)
-        if not match:
-            parser.error("--month doit respecter le format AAAA-MM, par exemple 2026-09")
-        args.target_year, args.target_month = int(match.group(1)), int(match.group(2))
-        if not 1 <= args.target_month <= 12:
-            parser.error("le mois doit être compris entre 01 et 12")
-    else:
-        args.target_month, args.target_year = month, year
-
-    if args.max_age_days < 1 or args.max_age_days > 3650:
-        parser.error("--max-age-days doit être compris entre 1 et 3650")
-    return args
-
-
-def main(argv: list[str] | None = None) -> int:
-    # Files containing payslips and local OAuth tokens should default to owner-only.
-    os.umask(0o077)
-    args = parse_args(argv)
-    if DEPENDENCY_ERROR:
-        missing = DEPENDENCY_ERROR.split("'")[1] if "'" in DEPENDENCY_ERROR else DEPENDENCY_ERROR
-        print(
-            f"Dépendance manquante ({missing}). Installe le projet avec :\n"
-            "  python -m pip install -e .",
-            file=sys.stderr,
-        )
-        return 2
-    first_of_month = date(args.target_year, args.target_month, 1)
-    query_start = first_of_month.strftime("%Y/%m/%d")
-    query = f"from:{args.sender} has:attachment filename:pdf after:{query_start} newer_than:{args.max_age_days}d"
-
-    print(f"Cible : {args.target_month:02d}/{args.target_year}")
-    print(f"Expéditeur : {args.sender}")
-    print(f"Recherche Gmail : {query}")
-    print(f"Destination : {args.output}")
-    if args.dry_run:
-        print("Mode simulation : aucun fichier PDF ne sera écrit.\n")
-
-    try:
-        creds = authenticate(args.credentials, args.token, args.reauth)
-        service = build("gmail", "v1", credentials=creds, cache_discovery=False)
-        message_ids = list_message_ids(service, query)
-        print(f"Messages correspondants : {len(message_ids)}")
-        if not message_ids:
-            print("Aucun courriel trouvé. Vérifie le compte Google autorisé, l'expéditeur et la période de recherche.")
-            return 0
-        candidates = list(fetch_pdf_attachments(service, message_ids))
-        print(f"Pièces jointes PDF récupérées en mémoire : {len(candidates)}\n")
-        saved, skipped, review = process_candidates(
-            candidates,
-            args.output,
-            args.target_month,
-            args.target_year,
-            args.dry_run,
-            args.employee_name,
-            args.year_digits,
-        )
-        verb = "à classer" if args.dry_run else "classé(s)"
-        print(f"\nBilan : {saved} {verb}, {skipped} ignoré(s), {review} à vérifier.")
-        if review:
-            print(f"Les PDF nécessitant une vérification seront rangés dans : {args.output / str(args.target_year) / 'A_VERIFIER'}")
-        return 0
-    except FileNotFoundError as exc:
-        print(f"ERREUR : {exc}", file=sys.stderr)
-        return 2
-    except HttpError as exc:
-        print(f"ERREUR Gmail API : {exc}", file=sys.stderr)
-        return 3
-    except Exception as exc:
-        print(f"ERREUR : {type(exc).__name__}: {exc}", file=sys.stderr)
-        return 1
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
-</file>
-
-<file path="install.sh">
-#!/usr/bin/env bash
-# =============================================================================
-# install.sh — Installation automatisée de fiche-paye
-#
-# Usage depuis le dossier du dépôt :
-#   ./install.sh
-#
-# Ce script :
-#   1. Installe pipx si absent (pacman / apt / pip)
-#   2. Installe la commande globale `fiche-paye` via pipx
-#   3. Cherche credentials.json (dans le dépôt ou sur clé USB montée)
-#      et le place au bon endroit avec les bonnes permissions
-#   4. Crée le dossier de destination des fiches de paie
-# =============================================================================
-set -euo pipefail
-
-# --- Couleurs -----------------------------------------------------------------
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BOLD='\033[1m'; NC='\033[0m'
-info()  { echo -e "${GREEN}[✓]${NC} $*"; }
-warn()  { echo -e "${YELLOW}[!]${NC} $*"; }
-error() { echo -e "${RED}[✗]${NC} $*" >&2; exit 1; }
-step()  { echo -e "\n${BOLD}==>${NC} $*"; }
-
-# --- Chemins ------------------------------------------------------------------
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/fiche-paye"
-CREDS_DEST="$CONFIG_DIR/credentials.json"
-OUTPUT_DIR="$HOME/Documents/Fiches-de-paie"
-
-# =============================================================================
-# 1. PIPX : installation si absent
-# =============================================================================
-step "Vérification de pipx"
-if ! command -v pipx &>/dev/null; then
-    warn "pipx non trouvé. Installation..."
-
-    if command -v pacman &>/dev/null; then
-        sudo pacman -Sy --noconfirm python-pipx
-    elif command -v apt-get &>/dev/null; then
-        sudo apt-get update -qq && sudo apt-get install -y pipx
-    elif command -v dnf &>/dev/null; then
-        sudo dnf install -y pipx
-    elif command -v pip &>/dev/null; then
-        pip install --user pipx
-        export PATH="$HOME/.local/bin:$PATH"
-    else
-        error "Impossible d'installer pipx automatiquement. Installe-le manuellement : https://pipx.pypa.io"
-    fi
-
-    # Assurer que ~/.local/bin est dans le PATH pour la session courante
-    export PATH="$HOME/.local/bin:$PATH"
-    pipx ensurepath --force || true
-fi
-info "pipx $(pipx --version) disponible"
-
-# =============================================================================
-# 2. INSTALLATION de fiche-paye via pipx
-# =============================================================================
-step "Installation de fiche-paye"
-if pipx list 2>/dev/null | grep -q "fiche.paye"; then
-    warn "fiche-paye déjà installé. Mise à jour..."
-    pipx install --force "$SCRIPT_DIR"
-else
-    pipx install "$SCRIPT_DIR"
-fi
-info "Commande 'fiche-paye' disponible globalement"
-
-# =============================================================================
-# 3. DOSSIER DE CONFIGURATION (permissions strictes)
-# =============================================================================
-step "Création du dossier de configuration"
-mkdir -p "$CONFIG_DIR"
-chmod 700 "$CONFIG_DIR"
-info "Dossier config : $CONFIG_DIR (chmod 700)"
-
-# =============================================================================
-# 4. CREDENTIALS.JSON : détection et placement sécurisé
-# =============================================================================
-step "Recherche du fichier credentials.json"
-
-place_credentials() {
-    local src="$1"
-    cp "$src" "$CREDS_DEST"
-    chmod 600 "$CREDS_DEST"
-    info "credentials.json placé dans $CREDS_DEST (chmod 600)"
-}
-
-if [[ -f "$CREDS_DEST" ]]; then
-    info "credentials.json déjà présent dans $CREDS_DEST — aucune action."
-
-# --- a) Fichier GPG chiffré dans le dépôt (recommandé pour versionner) --------
-elif [[ -f "$SCRIPT_DIR/credentials.json.gpg" ]]; then
-    info "Fichier GPG détecté : $SCRIPT_DIR/credentials.json.gpg"
-    if ! command -v gpg &>/dev/null; then
-        error "gpg est requis pour déchiffrer credentials.json.gpg. Installe gpg."
-    fi
-    gpg --quiet --decrypt "$SCRIPT_DIR/credentials.json.gpg" > "$CREDS_DEST"
-    chmod 600 "$CREDS_DEST"
-    info "credentials.json déchiffré et placé dans $CREDS_DEST (chmod 600)"
-
-# --- b) Fichier en clair dans le dépôt (non commité, exclus par .gitignore) --
-elif [[ -f "$SCRIPT_DIR/credentials.json" ]]; then
-    warn "credentials.json en clair trouvé dans le dépôt (non commité)."
-    place_credentials "$SCRIPT_DIR/credentials.json"
-
-# --- c) Recherche sur une clé USB montée -------------------------------------
-else
-    warn "Aucun credentials.json trouvé dans le dépôt. Recherche sur clés USB..."
-    found_usb=""
-
-    # Points de montage courants selon les distros Linux
-    for mount_base in "/run/media/$USER" "/media/$USER" "/mnt"; do
-        if [[ -d "$mount_base" ]]; then
-            while IFS= read -r -d '' candidate; do
-                info "Trouvé sur USB : $candidate"
-                found_usb="$candidate"
-                break 2
-            done < <(find "$mount_base" -maxdepth 3 -name "credentials.json" -print0 2>/dev/null)
-        fi
-    done
-
-    if [[ -n "$found_usb" ]]; then
-        place_credentials "$found_usb"
-    else
-        # --- d) Saisie manuelle du chemin -------------------------------------
-        warn "Aucune clé USB détectée."
-        echo ""
-        echo "  Place ton credentials.json dans UNE de ces sources, puis relance install.sh :"
-        echo "    • $SCRIPT_DIR/credentials.json          (non commité)"
-        echo "    • $SCRIPT_DIR/credentials.json.gpg      (chiffré GPG, peut être commité)"
-        echo "    • Sur une clé USB montée dans /run/media, /media ou /mnt"
-        echo ""
-        echo "  Ou saisis maintenant le chemin complet du fichier (Entrée pour ignorer) :"
-        read -r -p "  Chemin : " manual_path
-        if [[ -n "$manual_path" && -f "$manual_path" ]]; then
-            place_credentials "$manual_path"
-        else
-            warn "Installation complète SANS credentials.json."
-            warn "Tu pourras le placer manuellement dans : $CREDS_DEST"
-        fi
-    fi
-fi
-
-# =============================================================================
-# 5. DOSSIER DE DESTINATION DES FICHES DE PAIE
-# =============================================================================
-step "Création du dossier de classement"
-mkdir -p "$OUTPUT_DIR"
-chmod 700 "$OUTPUT_DIR"
-info "Répertoire fiches de paie : $OUTPUT_DIR (chmod 700)"
-
-# =============================================================================
-# RÉSUMÉ
-# =============================================================================
-echo ""
-echo -e "${BOLD}╔══════════════════════════════════════════════════════╗${NC}"
-echo -e "${BOLD}║            Installation terminée ✓                  ║${NC}"
-echo -e "${BOLD}╚══════════════════════════════════════════════════════╝${NC}"
-echo ""
-echo -e "  Commande disponible  : ${GREEN}fiche-paye${NC}"
-echo -e "  Config               : ${GREEN}$CONFIG_DIR${NC}"
-echo -e "  Fiches de paie       : ${GREEN}$OUTPUT_DIR${NC}"
-echo ""
-echo -e "  Commencer par une simulation :"
-echo -e "  ${BOLD}fiche-paye --dry-run${NC}"
-echo ""
-
-# Indique si un nouveau shell est nécessaire pour que PATH soit actif
-if ! command -v fiche-paye &>/dev/null; then
-    warn "Lance un nouveau terminal (ou 'source ~/.bashrc') pour activer la commande fiche-paye."
-fi
-</file>
-
-<file path="pyproject.toml">
-[build-system]
-requires = ["setuptools>=68"]
-build-backend = "setuptools.build_meta"
-
-[project]
-name = "fiche-paye"
-version = "0.1.0"
-description = "Classe localement les bulletins de paie PDF reçus dans Gmail"
-readme = "README.md"
-requires-python = ">=3.10"
-dependencies = [
-  "google-api-python-client>=2.100.0",
-  "google-auth-httplib2>=0.2.0",
-  "google-auth-oauthlib>=1.2.0",
-  "pypdf>=4.0.0",
-]
-
-[project.scripts]
-fiche-paye = "fiche_paye:main"
-
-[tool.setuptools]
-py-modules = ["fiche_paye"]
-
-[tool.ruff.lint]
-ignore = ["BLE001"]
-</file>
-
-<file path="README.md">
-# fiche-paye
-
-Petit outil Linux qui recherche dans Gmail les PDF envoyés par `admin@ouihelp.fr`, lit leur texte localement et classe uniquement les bulletins dont la période correspond au mois précédent.
-
-Nom par défaut : `MM-D_NOM-Prénom.pdf`, où `D` est le dernier chiffre de l'année. Exemple : `09-6_MARTIN-Jeanne.pdf` pour septembre 2026. Pour utiliser deux chiffres d'année (`09-26_...`), passer `--year-digits 2`.
-
-## Installation rapide (toute machine Linux)
-
-Lance simplement depuis le dossier du projet :
-
-```bash
-./install.sh
-```
-
-Le script :
-1. Installe `pipx` si absent (détecte pacman / apt / dnf)
-2. Installe la commande `fiche-paye` globalement (disponible depuis n'importe quel répertoire)
-3. Place `credentials.json` dans `~/.config/fiche-paye/` avec les bonnes permissions
-4. Crée le dossier `~/Documents/Fiches-de-paie/`
-
-### Fournir le fichier credentials.json au script
-
-Le script cherche le fichier dans l'ordre suivant :
-
-| Priorité | Source | Remarque |
-|----------|--------|----------|
-| 1 | `credentials.json.gpg` à la racine du dépôt | Chiffré GPG, **peut être commité** |
-| 2 | `credentials.json` à la racine du dépôt | Non commité (exclu par `.gitignore`) |
-| 3 | Clé USB montée (scan automatique) | Cherche dans `/run/media`, `/media`, `/mnt` |
-| 4 | Saisie manuelle du chemin | Demandé si rien n'est trouvé |
-
-**Pour chiffrer le fichier avec GPG (recommandé) :**
-```bash
-gpg --symmetric --cipher-algo AES256 -o credentials.json.gpg credentials.json
-```
-Ensuite `credentials.json.gpg` peut être versionné dans le dépôt ; le script le déchiffrera automatiquement au prochain `./install.sh`.
-
----
-
-## Sécurité et limites
-
-- Gmail est consulté avec l'autorisation OAuth `gmail.readonly`. Le programme ne modifie, n'envoie et ne supprime aucun courriel.
-- Les PDF sont téléchargés en mémoire et écrits localement uniquement s'ils correspondent au mois ciblé, ou s'ils nécessitent une vérification.
-- L'extraction PDF se fait localement avec `pypdf`, sans OCR ni service externe.
-- Les fichiers et le jeton OAuth sont créés avec des permissions limitées au compte local autant que possible.
-- Ne partage pas `credentials.json`, `token.json` ou les bulletins de paie.
-- Les modèles de bulletins varient. Si le nom ou la période n'est pas reconnu, le script ne devine pas : il ignore le bulletin ou le place dans `A_VERIFIER` selon le cas. Le parseur de nom devra éventuellement être ajusté à partir d'un bulletin anonymisé.
-
-## Installation (Arch/CachyOS/Linux)
-
-Depuis le dossier du projet :
-
-```bash
-python -m venv .venv
-.venv/bin/python -m pip install --upgrade pip
-.venv/bin/python -m pip install -e .
-```
-
-Cela crée la commande `fiche-paye` dans `.venv/bin/`. Pour la rendre directement disponible dans le terminal sans activer l'environnement à chaque fois, tu peux aussi installer l'outil avec `pipx install .` depuis ce dossier, si `pipx` est installé.
-
-## Configuration OAuth Google (à faire une fois)
-
-1. Ouvre https://console.cloud.google.com/ et crée ou sélectionne un projet.
-2. Active **Gmail API** dans « API et services ».
-3. Dans Google Auth Platform, configure la marque et l'audience. Pour un compte Gmail personnel et une application non publiée, sélectionne **Externe** si demandé et ajoute le compte Google autorisé dans **Utilisateurs tests**.
-4. Dans **Clients**, crée un client OAuth de type **Application de bureau** et télécharge le JSON.
-5. Place-le à l'emplacement suivant :
-
-```bash
-mkdir -p ~/.config/fiche-paye
-chmod 700 ~/.config/fiche-paye
-cp ~/Téléchargements/client_secret_*.json ~/.config/fiche-paye/credentials.json
-chmod 600 ~/.config/fiche-paye/credentials.json
-```
-
-Le nom précis du fichier téléchargé dépend de Google ; adapte le chemin du `cp` si nécessaire. Le premier lancement ouvre le navigateur pour que le titulaire de la boîte Gmail choisisse le compte et autorise la lecture. Le jeton local sera créé sous `~/.config/fiche-paye/token.json`.
-
-## Utilisation
-
-Toujours commencer par la simulation :
-
-```bash
-.venv/bin/fiche-paye --dry-run
-```
-
-Puis, si les périodes et noms proposés sont corrects :
-
-```bash
-.venv/bin/fiche-paye
-```
-
-Par défaut, le script vise le mois calendaire précédent et enregistre dans `~/Documents/Fiches-de-paie/AAAA/`.
-
-Quelques options :
-
-```bash
-# Traiter explicitement septembre 2026
-.venv/bin/fiche-paye --month 2026-09 --dry-run
-
-# Employer deux chiffres pour l'année
-.venv/bin/fiche-paye --year-digits 2 --dry-run
-
-# Si le nom du salarié n'est pas extrait correctement, fournir un nom de repli
-.venv/bin/fiche-paye --employee-name "MARTIN-Jeanne" --dry-run
-
-# Choisir un autre dossier de destination
-.venv/bin/fiche-paye --output "$HOME/Paie" --dry-run
-
-# Révoquer localement le jeton enregistré et refaire la connexion la prochaine fois
-.venv/bin/fiche-paye --reauth --dry-run
-```
-
-Pour obtenir la commande `fiche-paye` sans préfixe `.venv/bin/`, active l'environnement :
-
-```bash
-source .venv/bin/activate
-fiche-paye --dry-run
-```
-
-## Tests locaux
-
-```bash
-.venv/bin/python -m unittest discover -s tests -v
-```
-
-Les tests couvrent le parsing des dates, le changement d'année et le nom de fichier. Ils ne remplacent pas un essai sur un bulletin anonymisé réel.
 </file>
 
 </files>

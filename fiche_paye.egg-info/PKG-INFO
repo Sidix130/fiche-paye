@@ -15,6 +15,39 @@ Petit outil Linux qui recherche dans Gmail les PDF envoyés par `admin@ouihelp.f
 
 Nom par défaut : `MM-D_NOM-Prénom.pdf`, où `D` est le dernier chiffre de l'année. Exemple : `09-6_MARTIN-Jeanne.pdf` pour septembre 2026. Pour utiliser deux chiffres d'année (`09-26_...`), passer `--year-digits 2`.
 
+## Installation rapide (toute machine Linux)
+
+Lance simplement depuis le dossier du projet :
+
+```bash
+./install.sh
+```
+
+Le script :
+1. Installe `pipx` si absent (détecte pacman / apt / dnf)
+2. Installe la commande `fiche-paye` globalement (disponible depuis n'importe quel répertoire)
+3. Place `credentials.json` dans `~/.config/fiche-paye/` avec les bonnes permissions
+4. Crée le dossier `~/Documents/Fiches-de-paie/`
+
+### Fournir le fichier credentials.json au script
+
+Le script cherche le fichier dans l'ordre suivant :
+
+| Priorité | Source | Remarque |
+|----------|--------|----------|
+| 1 | `credentials.json.gpg` à la racine du dépôt | Chiffré GPG, **peut être commité** |
+| 2 | `credentials.json` à la racine du dépôt | Non commité (exclu par `.gitignore`) |
+| 3 | Clé USB montée (scan automatique) | Cherche dans `/run/media`, `/media`, `/mnt` |
+| 4 | Saisie manuelle du chemin | Demandé si rien n'est trouvé |
+
+**Pour chiffrer le fichier avec GPG (recommandé) :**
+```bash
+gpg --symmetric --cipher-algo AES256 -o credentials.json.gpg credentials.json
+```
+Ensuite `credentials.json.gpg` peut être versionné dans le dépôt ; le script le déchiffrera automatiquement au prochain `./install.sh`.
+
+---
+
 ## Sécurité et limites
 
 - Gmail est consulté avec l'autorisation OAuth `gmail.readonly`. Le programme ne modifie, n'envoie et ne supprime aucun courriel.
